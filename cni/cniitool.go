@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/containernetworking/cni/libcni"
+	"github.com/containernetworking/cni/pkg/types"
 )
 
 // Protocol parameters are passed to the plugins via OS environment variables.
@@ -130,17 +131,17 @@ func LoadConfList(dir string, handler func([]byte) ([]byte, error)) (*libcni.Net
 }
 
 // Run .
-func Run(config CNIToolConfig) error {
+func Run(config CNIToolConfig) (types.Result, error) {
 	netconf, err := LoadConfList(config.NetConfPath, config.Handler)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	var cniArgs [][2]string
 	if len(config.Args) > 0 {
 		cniArgs, err = parseArgs(config.Args)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -155,16 +156,12 @@ func Run(config CNIToolConfig) error {
 
 	switch config.Cmd {
 	case CmdAdd:
-		result, err := cninet.AddNetworkList(context.TODO(), netconf, rt)
-		if result != nil {
-			_ = result.Print()
-		}
-		return err
+		return cninet.AddNetworkList(context.TODO(), netconf, rt)
 	case CmdCheck:
-		return cninet.CheckNetworkList(context.TODO(), netconf, rt)
+		return nil, cninet.CheckNetworkList(context.TODO(), netconf, rt)
 	case CmdDel:
-		return cninet.DelNetworkList(context.TODO(), netconf, rt)
+		return nil, cninet.DelNetworkList(context.TODO(), netconf, rt)
 	default:
-		return fmt.Errorf("unsupported command %v", config.Cmd)
+		return nil, fmt.Errorf("unsupported command %v", config.Cmd)
 	}
 }

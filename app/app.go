@@ -43,6 +43,18 @@ func NewApp(handler handler.Handler, printVersion func()) *cli.App {
 				},
 				Action: runCNI(handler),
 			},
+			{
+				Name:  "clean",
+				Usage: "run as cni cleaner",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:        "config",
+						Usage:       "cni configure filename",
+						DefaultText: "/etc/docker/cni.yaml",
+					},
+				},
+				Action: runClean(handler),
+			},
 		},
 	}
 }
