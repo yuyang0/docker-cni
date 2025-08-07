@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"syscall"
 
 	"github.com/containernetworking/plugins/pkg/ip"
 	"github.com/containernetworking/plugins/pkg/ns"
@@ -106,6 +107,11 @@ func (_ *CalicoNetwork) SimulateCNIAdd(info *store.InterfaceInfo, state *specs.S
 
 	if err = netlink.LinkSetUp(hostVeth); err != nil {
 		return errors.Wrapf(err, "failed to set %q up", hostVethName)
+	}
+	// Now that the host side of the veth is moved, state set to UP, and configured with sysctls, we can add the routes to it in the host namespace.
+	err = SetupRoutes(hostVeth, info.IPs)
+	if err != nil {
+		return fmt.Errorf("error adding host side routes for interface: %s, error: %s", hostVeth.Attrs().Name, err)
 	}
 
 	return nil
@@ -284,4 +290,58 @@ func writeProcSys(path, value string) error {
 		err = err1
 	}
 	return err
+}
+
+// SetupRoutes sets up the routes for the host side of the veth pair.
+func SetupRoutes(hostVeth netlink.Link, IPs []string) error {
+
+	// Go through all the IPs and add routes for each IP in the result.
+	for _, ipStr := range IPs {
+
+		ipnet, err := parseCIDR(ipStr)
+		if err != nil {
+			return errors.Wrapf(err, "invalid ip: %s", ipStr)
+		}
+		route := netlink.Route{
+			LinkIndex: hostVeth.Attrs().Index,
+			Scope:     netlink.SCOPE_LINK,
+			Dst:       ipnet,
+		}
+		err = netlink.RouteAdd(&route)
+
+		if err != nil {
+			switch err {
+
+			// Route already exists, but not necessarily pointing to the same interface.
+			case syscall.EEXIST:
+				// List all the routes for the interface.
+				routes, err := netlink.RouteList(hostVeth, netlink.FAMILY_ALL)
+				if err != nil {
+					return fmt.Errorf("error listing routes")
+				}
+
+				// Go through all the routes pointing to the interface, and see if any of them is
+				// exactly what we are intending to program.
+				// If the route we want is already there then most likely it's programmed by Felix, so we ignore it,
+				// and we return an error if none of the routes match the route we're trying to program.
+				log.WithFields(log.Fields{"route": route, "scope": route.Scope}).Debug("Constructed route")
+				for _, r := range routes {
+					log.WithFields(log.Fields{"interface": hostVeth.Attrs().Name, "route": r, "scope": r.Scope}).Debug("Routes for the interface")
+					if r.LinkIndex == route.LinkIndex && r.Dst.IP.Equal(route.Dst.IP) && r.Scope == route.Scope {
+						// Route was already present on the host.
+						log.WithFields(log.Fields{"interface": hostVeth.Attrs().Name}).Infof("CNI skipping add route. Route already exists")
+						return nil
+					}
+				}
+				return fmt.Errorf("route (Ifindex: %d, Dst: %s, Scope: %v) already exists for an interface other than '%s'",
+					route.LinkIndex, route.Dst.String(), route.Scope, hostVeth.Attrs().Name)
+			default:
+				return fmt.Errorf("failed to add route (Ifindex: %d, Dst: %s, Scope: %v, Iface: %s): %v",
+					route.LinkIndex, route.Dst.String(), route.Scope, hostVeth.Attrs().Name, err)
+			}
+		}
+
+		log.WithFields(log.Fields{"interface": hostVeth, "IP": ipStr}).Debugf("CNI adding route")
+	}
+	return nil
 }
