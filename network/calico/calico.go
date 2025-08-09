@@ -14,6 +14,7 @@ import (
 
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
+	"github.com/projecteru2/docker-cni/config"
 	"github.com/projecteru2/docker-cni/store"
 	log "github.com/sirupsen/logrus"
 )
@@ -24,6 +25,64 @@ func New() *CalicoNetwork {
 	return &CalicoNetwork{}
 }
 
+func (_ *CalicoNetwork) ExtractNetworkInfo(conf *config.Config, state *specs.State) (*store.InterfaceInfo, error) {
+	ifname := conf.CNIIfname
+	netnsPath := fmt.Sprintf("/proc/%d/ns/net", state.Pid)
+
+	info := store.InterfaceInfo{
+		IFName: ifname,
+	}
+	var peerIndex int
+	err := ns.WithNetNSPath(netnsPath, func(_ ns.NetNS) error {
+		link, err := netlink.LinkByName(ifname)
+		if err != nil {
+			return fmt.Errorf("failed to get eth0: %v", err)
+		}
+		peerIndex = link.Attrs().ParentIndex
+
+		mac := link.Attrs().HardwareAddr.String()
+		info.MAC = mac
+
+		addrs, err := netlink.AddrList(link, netlink.FAMILY_ALL)
+		if err != nil {
+			return fmt.Errorf("failed to get addresses: %v", err)
+		}
+		for _, addr := range addrs {
+			info.IPs = append(info.IPs, addr.IP.String())
+		}
+
+		routes, err := netlink.RouteList(link, netlink.FAMILY_ALL)
+		if err != nil {
+			return fmt.Errorf("failed to get routes: %v", err)
+		}
+		for _, r := range routes {
+			dst := "default"
+			if r.Dst != nil {
+				dst = r.Dst.String()
+			}
+			via := ""
+			if r.Gw != nil {
+				via = r.Gw.String()
+			}
+			info.Routes = append(info.Routes, fmt.Sprintf("dst=%s via=%s", dst, via))
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to inspect %s in netns %s", ifname, netnsPath)
+	}
+	links, err := netlink.LinkList()
+	if err != nil {
+		log.Fatalf("Failed to list host interfaces: %v", err)
+	}
+	for _, link := range links {
+		if link.Attrs().Index == peerIndex {
+			info.HostIFName = link.Attrs().Name
+			break
+		}
+	}
+	return &info, nil
+}
 func (_ *CalicoNetwork) SimulateCNIAdd(info *store.InterfaceInfo, state *specs.State) (err error) {
 	var hasIPv4, hasIPv6 bool
 	hostVethName := info.HostIFName

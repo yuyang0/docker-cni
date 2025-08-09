@@ -9,18 +9,13 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/containernetworking/plugins/pkg/ns"
-	"github.com/vishvananda/netlink"
-
 	"github.com/containernetworking/cni/pkg/types"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"github.com/projecteru2/docker-cni/cni"
 	"github.com/projecteru2/docker-cni/config"
 	"github.com/projecteru2/docker-cni/handler"
-	"github.com/projecteru2/docker-cni/network"
-	"github.com/projecteru2/docker-cni/network/calico"
-	"github.com/projecteru2/docker-cni/store"
+	nwFact "github.com/projecteru2/docker-cni/network/factory"
 	log "github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
 )
@@ -85,6 +80,13 @@ func runCNI(handler handler.Handler) func(*cli.Context) error {
 					log.Errorf("[hook] failed to get container state: %+v", err)
 					return errors.WithStack(err)
 				}
+
+				nw, err := nwFact.NewNetwork(conf.CNIType)
+				if err != nil {
+					log.Errorf("[hook] failed to create network object: %v", err)
+					return errors.WithStack(err)
+				}
+
 				// create a new container
 				if st == nil {
 					res, err := runCNICommand(handler, conf, &state, cmd)
@@ -100,7 +102,7 @@ func runCNI(handler handler.Handler) func(*cli.Context) error {
 						return errors.WithStack(err)
 					}
 					log.Infof("[hook] CNI ADD result: %s", buf.String())
-					info, err := extractNetworkInfo(conf.CNIIfname, state.Pid)
+					info, err := nw.ExtractNetworkInfo(&conf, &state)
 					if err != nil {
 						log.Errorf("[hook] failed to extract network info: %+v", err)
 						return errors.WithStack(err)
@@ -123,15 +125,6 @@ func runCNI(handler handler.Handler) func(*cli.Context) error {
 				if err != nil {
 					log.Errorf("[hook] failed to get interface info: %+v", err)
 					return errors.WithStack(err)
-				}
-				var nw network.Network
-
-				switch strings.ToLower(conf.CNIType) {
-				case "calico":
-					nw = calico.New()
-				default:
-					log.Errorf("[hook] unsupported CNI type: %s", conf.CNIType)
-					return fmt.Errorf("unsupported CNI type: %s", conf.CNIType)
 				}
 				if err = nw.SimulateCNIAdd(info, &state); err != nil {
 					log.Errorf("[hook] failed to simulate CNI ADD: %+v", err)
@@ -171,62 +164,4 @@ func runCNICommand(handler handler.Handler, conf config.Config, state *specs.Sta
 	log.Infof("[hook] docker-cni running: %+v", cniToolConfig)
 	res, err = cni.Run(cniToolConfig)
 	return res, errors.WithStack(err)
-}
-
-func extractNetworkInfo(ifname string, containerPID int) (*store.InterfaceInfo, error) {
-	netnsPath := fmt.Sprintf("/proc/%d/ns/net", containerPID)
-
-	info := store.InterfaceInfo{
-		IFName: ifname,
-	}
-	var peerIndex int
-	err := ns.WithNetNSPath(netnsPath, func(_ ns.NetNS) error {
-		link, err := netlink.LinkByName(ifname)
-		if err != nil {
-			return fmt.Errorf("failed to get eth0: %v", err)
-		}
-		peerIndex = link.Attrs().ParentIndex
-
-		mac := link.Attrs().HardwareAddr.String()
-		info.MAC = mac
-
-		addrs, err := netlink.AddrList(link, netlink.FAMILY_ALL)
-		if err != nil {
-			return fmt.Errorf("failed to get addresses: %v", err)
-		}
-		for _, addr := range addrs {
-			info.IPs = append(info.IPs, addr.IP.String())
-		}
-
-		routes, err := netlink.RouteList(link, netlink.FAMILY_ALL)
-		if err != nil {
-			return fmt.Errorf("failed to get routes: %v", err)
-		}
-		for _, r := range routes {
-			dst := "default"
-			if r.Dst != nil {
-				dst = r.Dst.String()
-			}
-			via := ""
-			if r.Gw != nil {
-				via = r.Gw.String()
-			}
-			info.Routes = append(info.Routes, fmt.Sprintf("dst=%s via=%s", dst, via))
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to inspect %s in netns %s", ifname, netnsPath)
-	}
-	links, err := netlink.LinkList()
-	if err != nil {
-		log.Fatalf("Failed to list host interfaces: %v", err)
-	}
-	for _, link := range links {
-		if link.Attrs().Index == peerIndex {
-			info.HostIFName = link.Attrs().Name
-			break
-		}
-	}
-	return &info, nil
 }
